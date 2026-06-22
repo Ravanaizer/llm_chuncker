@@ -44,7 +44,7 @@ llm_glob/
 |Ресурс|Минимальные|Рекомендуемые|
 |:-|:-|:-|
 |RAM|16GB|64GB|
-|Disk|100GB (db index ~10k files)|500GB (db idex ~100k files)|
+|Disk|100GB (db index ~10k files)|500GB (db index ~100k files)|
 
 ### Python-зависимости
 
