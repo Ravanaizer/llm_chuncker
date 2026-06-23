@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PDF parser with hybrid approach: text extraction for text PDFs, Vision API for scans.
-Optimized with parallel processing and page batching for maximum speed.
+Optimized with parallel processing, page batching, and auto-retries.
 """
 
 import argparse
@@ -27,8 +27,12 @@ from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
+# Increased timeout for large models (31B+), reduced retries to avoid wasted time
 client = OpenAI(
-    api_key="dummy", base_url=config.API_BASE_URL, max_retries=1, timeout=120.0
+    api_key="dummy",
+    base_url=config.API_BASE_URL,
+    max_retries=1,
+    timeout=300.0,  # 5 minutes per request
 )
 
 SYSTEM_PROMPT = (
@@ -109,32 +113,52 @@ def clean_with_llm_direct_pdf(pdf_b64: str, model: str) -> str:
         messages=[{"role": "user", "content": content}],
         temperature=0.0,
         max_tokens=8192,
-        reasoning_effort="none",
     )
     return resp.choices[0].message.content.strip()
 
 
-def clean_with_llm_text(text: str, model: str, chunk_size: int = 4000) -> str:
-    """Clean text chunks via LLM API (for text PDFs)."""
+def clean_with_llm_text(text: str, model: str, chunk_size: int = 2000) -> str:
+    """Clean text chunks via LLM API (for text PDFs) with auto-retry and timing."""
     chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
     cleaned = []
 
     for i, chunk in enumerate(tqdm(chunks, desc="  LLM Text", leave=False)):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": chunk},
-                ],
-                temperature=0.0,
-                max_tokens=8192,
-                reasoning_effort="none",
-            )
-            cleaned.append(resp.choices[0].message.content.strip())
-        except Exception as e:
-            logging.error(f"  LLM chunk {i + 1} failed: {e}")
-            cleaned.append(chunk)
+        logging.info(
+            f"  -> Sending text chunk {i + 1}/{len(chunks)} ({len(chunk)} chars)"
+        )
+
+        start_time = time.time()
+        # Retry logic for "Model is unloaded"
+        for attempt in range(3):
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": chunk},
+                    ],
+                    temperature=0.0,
+                    max_tokens=8192,
+                )
+                elapsed = time.time() - start_time
+                cleaned.append(resp.choices[0].message.content.strip())
+                logging.info(f"  <- Chunk {i + 1} processed in {elapsed:.1f}s")
+                break  # Success, exit retry loop
+            except Exception as e:
+                error_msg = str(e)
+                if "Model is unloaded" in error_msg and attempt < 2:
+                    logging.warning(
+                        f"  <- Model is unloading, retrying in 5s... (Attempt {attempt + 1}/3)"
+                    )
+                    time.sleep(5)
+                else:
+                    elapsed = time.time() - start_time
+                    logging.error(
+                        f"  <- Chunk {i + 1} FAILED after {elapsed:.1f}s: {e}"
+                    )
+                    cleaned.append(chunk)
+                    break
+
         time.sleep(0.1)
 
     return "\n".join(cleaned)
@@ -160,13 +184,14 @@ def pdf_to_images_b64(pdf_path: Path, dpi: int = 150) -> list:
 
 
 def process_page_batch(batch_data: tuple, model: str) -> str:
-    """Process a batch of pages in a single LLM request."""
+    """Process a batch of pages in a single LLM request with auto-retry."""
     batch_num, images_b64_batch = batch_data
-    page_range = f"{batch_num * len(images_b64_batch) + 1}-{batch_num * len(images_b64_batch) + len(images_b64_batch)}"
+    start_page = batch_num * len(images_b64_batch) + 1
+    end_page = start_page + len(images_b64_batch) - 1
+    page_range = f"{start_page}-{end_page}"
 
     content = [{"type": "text", "text": f"Pages {page_range}. {SYSTEM_PROMPT}"}]
 
-    # Add all images from batch
     for b64_img in images_b64_batch:
         content.append(
             {
@@ -175,18 +200,30 @@ def process_page_batch(batch_data: tuple, model: str) -> str:
             }
         )
 
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": content}],
-            temperature=0.0,
-            max_tokens=8192,
-            reasoning_effort="none",
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"Batch {batch_num} FAILED: {e}")
-        return f"[Error processing batch {batch_num}]"
+    start_time = time.time()
+    # Retry logic for "Model is unloaded"
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": content}],
+                temperature=0.0,
+                max_tokens=8192,
+            )
+            elapsed = time.time() - start_time
+            logging.info(f"  <- Batch {batch_num} processed in {elapsed:.1f}s")
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            error_msg = str(e)
+            if "Model is unloaded" in error_msg and attempt < 2:
+                logging.warning(
+                    f"Batch {batch_num} model is unloading, retrying in 5s..."
+                )
+                time.sleep(5)
+            else:
+                elapsed = time.time() - start_time
+                logging.error(f"Batch {batch_num} FAILED after {elapsed:.1f}s: {e}")
+                return f"[Error processing batch {batch_num}]"
 
 
 def clean_with_llm_images_parallel(
@@ -196,7 +233,9 @@ def clean_with_llm_images_parallel(
     # Split images into batches
     batches = []
     for i in range(0, len(images_b64), pages_per_request):
-        batches.append((i // pages_per_request, images_b64[i : i + pages_per_request]))
+        batch_images = images_b64[i : i + pages_per_request]
+        batch_num = i // pages_per_request
+        batches.append((batch_num, batch_images))
 
     logging.info(
         f"  Processing {len(images_b64)} pages in {len(batches)} batches with {workers} workers"
@@ -204,7 +243,6 @@ def clean_with_llm_images_parallel(
 
     cleaned_batches = {}
 
-    # Process batches in parallel
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(process_page_batch, batch, model): batch[0]
@@ -247,6 +285,7 @@ def process_folder(
     pages_per_request: int = 3,
     workers: int = 3,
     use_text_extraction: bool = True,
+    chunk_size: int = 2000,
 ):
     """Process all PDFs in folder using hybrid approach."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -267,7 +306,7 @@ def process_folder(
 
     logging.info(f"Files to process: {len(files_to_process)} out of {len(pdf_files)}")
     logging.info(
-        f"Optimization: {pages_per_request} pages/request, {workers} parallel workers"
+        f"Optimization: {pages_per_request} pages/request, {workers} parallel workers, chunk_size={chunk_size}"
     )
 
     # Separate text PDFs from scans
@@ -317,7 +356,10 @@ def process_folder(
                     logging.warning(f"Skipped (empty): {pdf_path.name}")
                     continue
 
-                cleaned_md = clean_with_llm_text(raw_text, model)
+                logging.info(
+                    f"Processing text PDF: {pdf_path.name} ({len(raw_text)} chars)"
+                )
+                cleaned_md = clean_with_llm_text(raw_text, model, chunk_size=chunk_size)
                 out_path = output_dir / f"{pdf_path.stem}_cleaned.md"
                 out_path.write_text(cleaned_md, encoding="utf-8")
             except Exception as e:
@@ -380,6 +422,12 @@ def main():
         help="Number of parallel workers for LLM requests (default: 3)",
     )
     parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=2000,
+        help="Text chunk size in chars for text PDFs (default: 2000)",
+    )
+    parser.add_argument(
         "--no-text-extraction",
         action="store_true",
         help="Disable text extraction, use Vision API for all PDFs",
@@ -426,6 +474,7 @@ def main():
         try_direct_pdf=not args.no_direct_pdf,
         pages_per_request=args.pages_per_request,
         workers=args.workers,
+        chunk_size=args.chunk_size,
         use_text_extraction=not args.no_text_extraction,
     )
 
