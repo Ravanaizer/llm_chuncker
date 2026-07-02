@@ -9,7 +9,7 @@ import config
 
 def initialize_llm():
     llm = OpenAILike(
-        model="openai/gpt-oss-120b",
+        model="gemma-4-e4b-it",
         api_base=config.API_BASE_URL,
         api_key="not-needed",
         is_chat_model=True,

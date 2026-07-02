@@ -397,7 +397,7 @@ def main():
     )
     parser.add_argument("-i", "--input", required=True, help="Input folder with PDFs")
     parser.add_argument("-o", "--output", default=None, help="Output folder")
-    parser.add_argument("-m", "--model", default="google/gemma-4-31b", help="LLM model")
+    parser.add_argument("-m", "--model", default="gemma-4-e4b-it", help="LLM model")
     parser.add_argument(
         "--no-skip", action="store_true", help="Reprocess already done files"
     )
@@ -412,20 +412,20 @@ def main():
     parser.add_argument(
         "--pages-per-request",
         type=int,
-        default=3,
-        help="Number of pages to send in one LLM request (default: 3)",
+        default=5,
+        help="Number of pages to send in one LLM request (default: 5)",
     )
     parser.add_argument(
         "--workers",
         type=int,
-        default=3,
-        help="Number of parallel workers for LLM requests (default: 3)",
+        default=5,
+        help="Number of parallel workers for LLM requests (default: 5)",
     )
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=2000,
-        help="Text chunk size in chars for text PDFs (default: 2000)",
+        default=5000,
+        help="Text chunk size in chars for text PDFs (default: 5000)",
     )
     parser.add_argument(
         "--no-text-extraction",
